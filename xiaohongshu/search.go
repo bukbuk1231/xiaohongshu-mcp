@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-rod/rod"
+	"github.com/sirupsen/logrus"
 	"github.com/xpzouying/xiaohongshu-mcp/errors"
 )
 
@@ -42,10 +43,10 @@ var filterOptionsMap = map[int][]internalFilterOption{
 		{FiltersIndex: 1, TagsIndex: 4, Text: "最多评论"},
 		{FiltersIndex: 1, TagsIndex: 5, Text: "最多收藏"},
 	},
-	2: { // 笔记类型
+	2: { // 笔记类型 (DOM有隐藏重复: 不限,视频,视频hidden,图文hidden,图文visible)
 		{FiltersIndex: 2, TagsIndex: 1, Text: "不限"},
 		{FiltersIndex: 2, TagsIndex: 2, Text: "视频"},
-		{FiltersIndex: 2, TagsIndex: 3, Text: "图文"},
+		{FiltersIndex: 2, TagsIndex: 5, Text: "图文"},
 	},
 	3: { // 发布时间
 		{FiltersIndex: 3, TagsIndex: 1, Text: "不限"},
@@ -141,15 +142,22 @@ func validateInternalFilterOption(filter internalFilterOption) error {
 		return fmt.Errorf("无效的筛选组索引 %d，有效范围为 1-5", filter.FiltersIndex)
 	}
 
-	// 检查标签索引是否在对应筛选组的有效范围内
+	// 检查筛选组是否存在
 	options, exists := filterOptionsMap[filter.FiltersIndex]
 	if !exists {
 		return fmt.Errorf("筛选组 %d 不存在", filter.FiltersIndex)
 	}
 
-	if filter.TagsIndex < 1 || filter.TagsIndex > len(options) {
-		return fmt.Errorf("筛选组 %d 的标签索引 %d 超出范围，有效范围为 1-%d",
-			filter.FiltersIndex, filter.TagsIndex, len(options))
+	// 检查TagsIndex是否在已定义的选项中（而不是简单的数组长度检查）
+	found := false
+	for _, opt := range options {
+		if opt.TagsIndex == filter.TagsIndex {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("筛选组 %d 中未定义 TagsIndex=%d", filter.FiltersIndex, filter.TagsIndex)
 	}
 
 	return nil
@@ -201,12 +209,25 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 		// 等待筛选面板出现
 		page.MustWait(`() => document.querySelector('div.filter-panel') !== null`)
 
-		// 应用所有筛选条件
+		// 应用筛选条件 - 用 CSS 选择器点击
 		for _, filter := range allInternalFilters {
-			selector := fmt.Sprintf(`div.filter-panel div.filters:nth-child(%d) div.tags:nth-child(%d)`,
+			logrus.Infof("Clicking filter: group=%d, tag=%d, text='%s'", filter.FiltersIndex, filter.TagsIndex, filter.Text)
+			// 选择器：div.filters:nth-child(N) 内的 .tag-container 内的第 M 个 .tags
+			selector := fmt.Sprintf(`div.filter-panel div.filters:nth-child(%d) .tag-container .tags:nth-child(%d)`,
 				filter.FiltersIndex, filter.TagsIndex)
-			option := page.MustElement(selector)
+			logrus.Infof("Using selector: %s", selector)
+			option, err := page.Element(selector)
+			if err != nil {
+				logrus.Warnf("Failed to find element with selector '%s': %v", selector, err)
+				continue
+			}
+			if option == nil {
+				logrus.Warnf("Element not found for selector '%s'", selector)
+				continue
+			}
 			option.MustClick()
+			logrus.Infof("Successfully clicked '%s'", filter.Text)
+			page.MustWaitStable()
 		}
 
 		// 等待页面更新
