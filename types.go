@@ -49,7 +49,7 @@ type CommentLoadConfig struct {
 // FeedDetailRequest Feed详情请求
 type FeedDetailRequest struct {
 	FeedID          string             `json:"feed_id" binding:"required"`
-	XsecToken       string             `json:"xsec_token" binding:"required"`
+	XsecToken       string             `json:"xsec_token,omitempty"`
 	LoadAllComments bool               `json:"load_all_comments,omitempty"`
 	CommentConfig   *CommentLoadConfig `json:"comment_config,omitempty"`
 }

@@ -833,13 +833,10 @@ func (f *FeedDetailAction) extractFeedDetail(page *rod.Page, feedID string) (*Fe
 		}),
 	)
 
-	if err != nil {
-		logrus.Errorf("提取Feed详情失败: %v", err)
-		return nil, fmt.Errorf("提取Feed详情失败: %w", err)
-	}
-
-	if result == "" {
-		return nil, errors.ErrNoFeedDetail
+	// rednote.com 不使用 __INITIAL_STATE__，回退到 DOM 提取
+	if err != nil || result == "" {
+		logrus.Info("尝试使用DOM方式提取Feed详情（rednote.com兼容模式）")
+		return f.extractFeedDetailFromDOM(page, feedID)
 	}
 
 	var noteDetailMap map[string]struct {
@@ -862,6 +859,61 @@ func (f *FeedDetailAction) extractFeedDetail(page *rod.Page, feedID string) (*Fe
 	}, nil
 }
 
+// extractFeedDetailFromDOM 从DOM中提取Feed详情（rednote.com兼容）
+func (f *FeedDetailAction) extractFeedDetailFromDOM(page *rod.Page, feedID string) (*FeedDetailResponse, error) {
+	result := page.MustEval(`() => {
+		try {
+			const title = (document.querySelector('#detail-title') || document.querySelector('.title'))?.textContent?.trim() || '';
+			const desc = (document.querySelector('#detail-desc') || document.querySelector('.desc'))?.textContent?.trim() || '';
+			const authorName = (document.querySelector('.author-wrapper .username') || document.querySelector('.user-info .username'))?.textContent?.trim() || '';
+			const avatarUrl = (document.querySelector('.author-wrapper .avatar img') || document.querySelector('.user-info .avatar img'))?.getAttribute('src') || '';
+			const likeCount = document.querySelector('.like-wrapper .count')?.textContent?.trim() || '0';
+			const collectCount = document.querySelector('.collect-wrapper .count')?.textContent?.trim() || '0';
+			const commentCount = document.querySelector('.chat-wrapper .count')?.textContent?.trim() || '0';
+
+			// 提取所有图片
+			const images = [];
+			const seenUrls = new Set();
+			document.querySelectorAll('.swiper-slide img, [class*="slider"] img, [class*="carousel"] img, article img').forEach(img => {
+				const src = img.src || img.getAttribute('data-src');
+				if (src && !seenUrls.has(src) && !src.includes('avatar')) {
+					seenUrls.add(src);
+					images.push({ url: src.replace('http://', 'https://') });
+				}
+			});
+
+			return JSON.stringify({
+				note: {
+					title: title,
+					desc: desc,
+					user: { nickname: authorName, avatar: avatarUrl },
+					interact_info: { liked_count: likeCount, collected_count: collectCount, comment_count: commentCount },
+					image_list: images
+				}
+			});
+		} catch (e) {
+			return '';
+		}
+	}`).String()
+
+	if result == "" {
+		return nil, errors.ErrNoFeedDetail
+	}
+
+	var data struct {
+		Note FeedDetail `json:"note"`
+	}
+
+	if err := json.Unmarshal([]byte(result), &data); err != nil {
+		return nil, fmt.Errorf("DOM提取失败: %w", err)
+	}
+
+	return &FeedDetailResponse{
+		Note:     data.Note,
+		Comments: CommentList{},
+	}, nil
+}
+
 func makeFeedDetailURL(feedID, xsecToken string) string {
-	return fmt.Sprintf("https://www.xiaohongshu.com/explore/%s?xsec_token=%s&xsec_source=pc_feed", feedID, xsecToken)
+	return fmt.Sprintf("https://www.rednote.com/explore/%s?xsec_token=%s&xsec_source=pc_feed", feedID, xsecToken)
 }

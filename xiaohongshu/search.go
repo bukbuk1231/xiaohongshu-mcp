@@ -172,7 +172,8 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 	page.MustNavigate(searchURL)
 	page.MustWaitStable()
 
-	page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
+	// 等待搜索结果加载（使用DOM元素而非__INITIAL_STATE__）
+	page.MustWait(`() => document.querySelectorAll('section.note-item').length > 0`)
 
 	// 如果有筛选条件，则应用筛选
 	if len(filters) > 0 {
@@ -210,24 +211,130 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 
 		// 等待页面更新
 		page.MustWaitStable()
-		// 重新等待 __INITIAL_STATE__ 更新
-		page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
+		// 等待搜索结果重新加载
+		page.MustWait(`() => document.querySelectorAll('section.note-item').length > 0`)
 	}
 
+	// 从DOM提取搜索结果（rednote.com不使用__INITIAL_STATE__）
+	return s.extractFeedsFromDOM(page)
+}
+
+// extractFeedsFromDOM 从DOM元素中提取Feed数据
+func (s *SearchAction) extractFeedsFromDOM(page *rod.Page) ([]Feed, error) {
 	result := page.MustEval(`() => {
-		if (window.__INITIAL_STATE__ &&
-		    window.__INITIAL_STATE__.search &&
-		    window.__INITIAL_STATE__.search.feeds) {
-			const feeds = window.__INITIAL_STATE__.search.feeds;
-			const feedsData = feeds.value !== undefined ? feeds.value : feeds._value;
-			if (feedsData) {
-				return JSON.stringify(feedsData);
+		const items = document.querySelectorAll('section.note-item');
+		const feeds = [];
+
+		items.forEach(item => {
+			try {
+				// 提取标题 - 尝试多种selector
+				let title = '';
+				const titleSelectors = [
+					'.footer .title span',
+					'.footer .title',
+					'.note-content .title',
+					'a.title span',
+					'.title span',
+					'.desc'
+				];
+				for (const sel of titleSelectors) {
+					const el = item.querySelector(sel);
+					if (el && el.textContent.trim()) {
+						title = el.textContent.trim();
+						break;
+					}
+				}
+
+				// 提取笔记ID和xsec_token（从链接中）
+				const linkEl = item.querySelector('a[href*="/search_result/"]') || item.querySelector('a[href*="/explore/"]');
+				let noteId = '';
+				let xsecToken = '';
+				if (linkEl) {
+					const href = linkEl.getAttribute('href');
+					// 匹配 /search_result/{id} 或 /explore/{id}
+					const match = href.match(/\/search_result\/([a-f0-9]+)/) || href.match(/\/explore\/([a-f0-9]+)/);
+					if (match) {
+						noteId = match[1];
+					}
+					// 提取xsec_token（可能包含特殊字符如=）
+					const tokenMatch = href.match(/xsec_token=([^&]*)/);
+					if (tokenMatch) {
+						xsecToken = tokenMatch[1]; // 不decode，保持原样
+					}
+				}
+
+				// 提取封面图片 - 尝试多种selector
+				let coverUrl = '';
+				const coverSelectors = ['a.cover img', '.cover img', 'img.cover', 'a img'];
+				for (const sel of coverSelectors) {
+					const el = item.querySelector(sel);
+					if (el) {
+						coverUrl = el.getAttribute('src') || el.getAttribute('data-src') || '';
+						if (coverUrl) break;
+					}
+				}
+
+				// 提取点赞数 - 尝试多种selector
+				let likeCount = '0';
+				const likeSelectors = ['.like-wrapper .count', '.like-wrapper span:last-child', '.like span', '.engage-bar .like', '[class*="like"] span'];
+				for (const sel of likeSelectors) {
+					const el = item.querySelector(sel);
+					if (el && el.textContent.trim()) {
+						likeCount = el.textContent.trim();
+						break;
+					}
+				}
+
+				// 提取作者信息 - 尝试多种selector
+				let authorName = '';
+				const authorSelectors = ['.author-wrapper .name', '.author .name', '.author-wrapper .author-name', '.nickname', '.user-name'];
+				for (const sel of authorSelectors) {
+					const el = item.querySelector(sel);
+					if (el && el.textContent.trim()) {
+						authorName = el.textContent.trim();
+						break;
+					}
+				}
+
+				// 提取头像
+				let avatarUrl = '';
+				const avatarSelectors = ['.author-wrapper .author-avatar img', '.author img', '.avatar img'];
+				for (const sel of avatarSelectors) {
+					const el = item.querySelector(sel);
+					if (el) {
+						avatarUrl = el.getAttribute('src') || '';
+						if (avatarUrl) break;
+					}
+				}
+
+				if (noteId) {
+					feeds.push({
+						id: noteId,
+						xsecToken: xsecToken,
+						noteCard: {
+							displayTitle: title,
+							cover: {
+								url: coverUrl
+							},
+							interactInfo: {
+								likedCount: likeCount
+							},
+							user: {
+								nickname: authorName,
+								avatar: avatarUrl
+							}
+						}
+					});
+				}
+			} catch (e) {
+				console.error('Error extracting item:', e);
 			}
-		}
-		return "";
+		});
+
+		return JSON.stringify(feeds);
 	}`).String()
 
-	if result == "" {
+	if result == "" || result == "[]" {
 		return nil, errors.ErrNoFeeds
 	}
 
@@ -245,7 +352,7 @@ func makeSearchURL(keyword string) string {
 	values.Set("keyword", keyword)
 	values.Set("source", "web_explore_feed")
 
-	//https://www.xiaohongshu.com/search_result?keyword=%25E7%258E%258B%25E5%25AD%2590&source=web_search_result_notes
-	//https://www.xiaohongshu.com/search_result?keyword=%25E7%258E%258B%25E5%25AD%2590&source=web_explore_feed
-	return fmt.Sprintf("https://www.xiaohongshu.com/search_result?%s", values.Encode())
+	//https://www.rednote.com/search_result?keyword=%25E7%258E%258B%25E5%25AD%2590&source=web_search_result_notes
+	//https://www.rednote.com/search_result?keyword=%25E7%258E%258B%25E5%25AD%2590&source=web_explore_feed
+	return fmt.Sprintf("https://www.rednote.com/search_result?%s", values.Encode())
 }

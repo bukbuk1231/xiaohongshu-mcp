@@ -33,7 +33,7 @@ type PublishAction struct {
 }
 
 const (
-	urlOfPublic = `https://creator.xiaohongshu.com/publish/publish?source=official`
+	urlOfPublic = `https://creator.rednote.com/publish/publish?source=official`
 )
 
 func NewPublishImageAction(page *rod.Page) (*PublishAction, error) {
