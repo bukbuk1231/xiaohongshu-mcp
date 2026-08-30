@@ -168,7 +168,7 @@ type SearchAction struct {
 }
 
 func NewSearchAction(page *rod.Page) *SearchAction {
-	pp := page.Timeout(60 * time.Second)
+	pp := page.Timeout(300 * time.Second) // 5分钟超时
 
 	return &SearchAction{page: pp}
 }
@@ -178,10 +178,10 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 
 	searchURL := makeSearchURL(keyword)
 	page.MustNavigate(searchURL)
-	page.MustWaitStable()
 
-	// 等待搜索结果加载（使用DOM元素而非__INITIAL_STATE__）
-	page.MustWait(`() => document.querySelectorAll('section.note-item').length > 0`)
+	// 搜索页是无限滚动+图片懒加载, DOM 永远不"稳定", 不能用 WaitStable。
+	// note-item 出现得比数据早(会先渲染上一次的缓存结果), 所以等 store 里的搜索结果。
+	waitSearchFeeds(page)
 
 	// 如果有筛选条件，则应用筛选
 	if len(filters) > 0 {
@@ -207,7 +207,7 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 		filterButton.MustHover()
 
 		// 等待筛选面板出现
-		page.MustWait(`() => document.querySelector('div.filter-panel') !== null`)
+		page.MustElement(`div.filter-panel`)
 
 		// 应用筛选条件 - 用 CSS 选择器点击
 		for _, filter := range allInternalFilters {
@@ -227,17 +227,56 @@ func (s *SearchAction) Search(ctx context.Context, keyword string, filters ...Fi
 			}
 			option.MustClick()
 			logrus.Infof("Successfully clicked '%s'", filter.Text)
-			page.MustWaitStable()
+			// 同上, 这里不能用 WaitStable, 给筛选生效留一点时间即可
+			time.Sleep(time.Second)
 		}
 
-		// 等待页面更新
-		page.MustWaitStable()
-		// 等待搜索结果重新加载
-		page.MustWait(`() => document.querySelectorAll('section.note-item').length > 0`)
+		// 等待筛选后的搜索结果重新加载
+		waitSearchFeeds(page)
 	}
 
-	// 从DOM提取搜索结果（rednote.com不使用__INITIAL_STATE__）
+	// 优先从 __INITIAL_STATE__ 读取(字段完整、点赞收藏是精确数字), DOM 提取作为兜底
+	if feeds, err := extractFeedsFromState(page); err == nil && len(feeds) > 0 {
+		return feeds, nil
+	}
+	logrus.Warn("搜索结果不在 __INITIAL_STATE__ 中, 回退到 DOM 提取")
 	return s.extractFeedsFromDOM(page)
+}
+
+// searchFeedsJS 从 store 中取搜索结果。搜索页的 feeds 是 Vue ref, 需要 unwrap。
+const searchFeedsJS = `() => {
+	const unwrap = v => (v && typeof v === 'object' && ('value' in v)) ? v.value :
+		(v && v._value !== undefined ? v._value : v);
+	const s = window.__INITIAL_STATE__;
+	if (!s || !s.search) return "";
+	const feeds = unwrap(s.search.feeds);
+	if (!Array.isArray(feeds) || feeds.length === 0) return "";
+	return JSON.stringify(feeds);
+}`
+
+// waitSearchFeeds 等待搜索结果注入 store(约 3-4 秒), 超时后不报错, 交给调用方兜底。
+func waitSearchFeeds(page *rod.Page) {
+	for i := 0; i < 60; i++ {
+		if page.MustEval(searchFeedsJS).String() != "" {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	logrus.Warn("等待搜索结果超时")
+}
+
+// extractFeedsFromState 从 __INITIAL_STATE__ 提取搜索结果
+func extractFeedsFromState(page *rod.Page) ([]Feed, error) {
+	result := page.MustEval(searchFeedsJS).String()
+	if result == "" {
+		return nil, errors.ErrNoFeeds
+	}
+
+	var feeds []Feed
+	if err := json.Unmarshal([]byte(result), &feeds); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal search feeds: %w", err)
+	}
+	return feeds, nil
 }
 
 // extractFeedsFromDOM 从DOM元素中提取Feed数据
@@ -267,7 +306,11 @@ func (s *SearchAction) extractFeedsFromDOM(page *rod.Page) ([]Feed, error) {
 				}
 
 				// 提取笔记ID和xsec_token（从链接中）
-				const linkEl = item.querySelector('a[href*="/search_result/"]') || item.querySelector('a[href*="/explore/"]');
+				// 注意: note-item 内第一个 a 是隐藏的空链接(不带 token), 必须优先取带 xsec_token 的
+				const linkEl = item.querySelector('a[href*="/search_result/"][href*="xsec_token="]')
+					|| item.querySelector('a[href*="/explore/"][href*="xsec_token="]')
+					|| item.querySelector('a[href*="/search_result/"]')
+					|| item.querySelector('a[href*="/explore/"]');
 				let noteId = '';
 				let xsecToken = '';
 				if (linkEl) {
