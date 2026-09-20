@@ -535,12 +535,25 @@ func calculateScrollDelta(viewportHeight int, baseRatio float64) float64 {
 	return scrollDelta + float64(rand.Intn(100)-50)
 }
 
+// scrollInto 把元素滚进视野，失败只记一条日志。
+//
+// 不能直接 el.MustScrollIntoView()：上面用 page.Timeout(2s).Element() 找到的元素，
+// 继承的是那 2 秒里**剩下**的零头——查找慢一点就只剩几十毫秒，滚动必然
+// deadline exceeded，而 Must 版本是 panic，整个请求会变成 500。
+// 所以先 Context() 回到 page 自己的 context（10 分钟那个）再给一个独立预算。
+// 机器一忙查找就变慢，这条就会从“偶发”变成“必现”。
+func scrollInto(page *rod.Page, el *rod.Element) {
+	if err := el.Context(page.GetContext()).Timeout(5 * time.Second).ScrollIntoView(); err != nil {
+		logrus.Warnf("滚动到元素失败，继续: %v", err)
+	}
+}
+
 func scrollToCommentsArea(page *rod.Page) {
 	logrus.Info("滚动到评论区...")
 
 	// 先定位到评论区
 	if el, err := page.Timeout(2 * time.Second).Element(".comments-container"); err == nil {
-		el.MustScrollIntoView()
+		scrollInto(page, el)
 	}
 	// 等待滚动完成
 	time.Sleep(500 * time.Millisecond)
@@ -575,9 +588,8 @@ func scrollToLastComment(page *rod.Page) {
 	if err != nil || len(elements) == 0 {
 		return
 	}
-	// 滚动到最后一个评论
-	lastComment := elements[len(elements)-1]
-	lastComment.MustScrollIntoView()
+	// 滚动到最后一个评论（同样不能用 Must 版本，见 scrollInto）
+	scrollInto(page, elements[len(elements)-1])
 }
 
 // ========== DOM 查询 ==========
